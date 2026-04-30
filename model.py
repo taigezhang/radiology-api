@@ -1,133 +1,134 @@
-from __future__ import annotations
-
 import re
-from datetime import datetime
-from functools import lru_cache
-from typing import Any, Dict, Optional
+from typing import Dict, List, Set
 
-from config import (
-    BODY_TERMS,
-    CLINICAL_TERMS,
-    MODALITY_ALIASES,
-    NEGATIVE_EXAM_TERMS,
-    STOPWORDS,
-    THRESHOLD,
-    WEIGHTS,
-)
-from schemas import CurrentStudy, Study
+from config import ANATOMY_GROUPS, IMPORTANT_KEYWORDS, MODALITIES, THRESHOLD, WEIGHTS
+from schemas import Case, PredictionItem, PriorStudy
 
 
-def normalize(text: str) -> str:
-    text = text.lower().replace("cntrst", "contrast")
-    text = re.sub(r"[^a-z0-9+/-]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+def normalize_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).lower().replace("_", " ").replace("-", " ")
 
 
-@lru_cache(maxsize=20000)
-def parse_description(desc: str) -> Dict[str, Any]:
-    s = normalize(desc)
-    tokens = {t for t in s.split() if t and t not in STOPWORDS}
-
-    modality = None
-    for alias, canonical in sorted(MODALITY_ALIASES.items(), key=lambda x: -len(x[0])):
-        if re.search(rf"\b{re.escape(alias)}\b", s):
-            modality = canonical
-            break
-
-    bodies = {t for t in tokens if t in BODY_TERMS}
-    clinical = {t for t in tokens if t in CLINICAL_TERMS}
-    negative = {t for t in tokens if t in NEGATIVE_EXAM_TERMS}
-
-    # Compound and synonym-style expansions used during error analysis.
-    if "head" in tokens and modality == "ct":
-        bodies.add("brain")
-    if "brain" in tokens:
-        bodies.add("head")
-    if "c" in tokens and "spine" in tokens:
-        bodies.add("cervical")
-    if "l" in tokens and "spine" in tokens:
-        bodies.add("lumbar")
-    if "t" in tokens and "spine" in tokens:
-        bodies.add("thoracic")
-
-    return {
-        "raw": s,
-        "tokens": tokens,
-        "modality": modality,
-        "bodies": bodies,
-        "clinical": clinical,
-        "negative": negative,
-    }
+def tokenize(text: str) -> Set[str]:
+    text = normalize_text(text)
+    return set(re.findall(r"[a-z0-9]+", text))
 
 
-def years_between(current_date: str, prior_date: str) -> Optional[float]:
-    try:
-        c = datetime.fromisoformat(current_date[:10])
-        p = datetime.fromisoformat(prior_date[:10])
-        return abs((c - p).days) / 365.25
-    except Exception:
-        return None
+def collect_study_text(study) -> str:
+    if study is None:
+        return ""
+
+    if isinstance(study, dict):
+        parts = []
+        for key in ["description", "modality", "body_part", "report", "reason", "indication", "procedure"]:
+            if key in study and study[key]:
+                parts.append(str(study[key]))
+        return " ".join(parts)
+
+    parts = []
+    for attr in ["description", "modality", "body_part", "report"]:
+        value = getattr(study, attr, "")
+        if value:
+            parts.append(str(value))
+    return " ".join(parts)
 
 
-def text_similarity(a_tokens: set[str], b_tokens: set[str]) -> float:
-    if not a_tokens or not b_tokens:
+def detect_modality(text: str) -> str:
+    text = normalize_text(text)
+    for modality, terms in MODALITIES.items():
+        for term in terms:
+            if term in text:
+                return modality
+    return ""
+
+
+def detect_anatomy(text: str) -> Set[str]:
+    text = normalize_text(text)
+    groups = set()
+
+    for group, terms in ANATOMY_GROUPS.items():
+        for term in terms:
+            if term in text:
+                groups.add(group)
+                break
+
+    return groups
+
+
+def keyword_overlap_score(current_tokens: Set[str], prior_tokens: Set[str]) -> float:
+    overlap = current_tokens.intersection(prior_tokens)
+
+    if not overlap:
         return 0.0
-    return len(a_tokens & b_tokens) / max(1, len(a_tokens | b_tokens))
-
-
-def score_pair(current: CurrentStudy, prior: Study) -> float:
-    cur = parse_description(current.study_description)
-    prv = parse_description(prior.study_description)
-    yrs = years_between(current.study_date, prior.study_date)
 
     score = 0.0
+    score += min(len(overlap), 4) * WEIGHTS["keyword_overlap"]
 
-    if cur["raw"] == prv["raw"]:
-        score += WEIGHTS["exact_description"]
-
-    if cur["modality"] and prv["modality"]:
-        if cur["modality"] == prv["modality"]:
-            score += WEIGHTS["same_modality"]
-        elif {cur["modality"], prv["modality"]} in [{"mri", "mra"}, {"ct", "cta"}]:
-            score += WEIGHTS["related_modality"]
-        else:
-            score += WEIGHTS["different_modality"]
-
-    body_overlap = cur["bodies"] & prv["bodies"]
-    if body_overlap:
-        score += WEIGHTS["body_overlap_base"]
-        score += min(
-            WEIGHTS["body_overlap_bonus_cap"],
-            len(body_overlap) * WEIGHTS["body_overlap_bonus_each"],
-        )
-    else:
-        score += WEIGHTS["no_body_overlap"]
-
-    if cur["clinical"] & prv["clinical"]:
-        score += WEIGHTS["clinical_overlap"]
-
-    score += WEIGHTS["lexical_similarity_multiplier"] * text_similarity(cur["tokens"], prv["tokens"])
-
-    if yrs is not None:
-        if yrs <= 1:
-            score += WEIGHTS["recency_le_1_year"]
-        elif yrs <= 3:
-            score += WEIGHTS["recency_le_3_years"]
-        elif yrs > 8:
-            score += WEIGHTS["old_prior_gt_8_years"]
-
-    if prv["negative"] and not (body_overlap and cur["modality"] == prv["modality"]):
-        score += WEIGHTS["negative_exam_penalty"]
-
-    if (
-        ("stroke" in cur["clinical"] or "stroke" in prv["clinical"])
-        and ({"brain", "head"} & cur["bodies"])
-        and ({"brain", "head"} & prv["bodies"])
-    ):
-        score += WEIGHTS["stroke_brain_bonus"]
+    important_overlap = overlap.intersection(IMPORTANT_KEYWORDS)
+    if important_overlap:
+        score += WEIGHTS["strong_keyword_overlap"]
 
     return score
 
 
-def predict_pair(current: CurrentStudy, prior: Study, threshold: float = THRESHOLD) -> bool:
-    return score_pair(current, prior) >= threshold
+def has_negative_conflict(current_anatomy: Set[str], prior_anatomy: Set[str]) -> bool:
+    if not current_anatomy or not prior_anatomy:
+        return False
+
+    return current_anatomy.isdisjoint(prior_anatomy)
+
+
+def score_pair(current_study: Dict, prior: PriorStudy) -> float:
+    current_text = collect_study_text(current_study)
+    prior_text = collect_study_text(prior)
+
+    current_tokens = tokenize(current_text)
+    prior_tokens = tokenize(prior_text)
+
+    current_modality = detect_modality(current_text)
+    prior_modality = detect_modality(prior_text)
+
+    current_anatomy = detect_anatomy(current_text)
+    prior_anatomy = detect_anatomy(prior_text)
+
+    score = 0.0
+
+    if current_modality and prior_modality and current_modality == prior_modality:
+        score += WEIGHTS["same_modality"]
+
+    if current_modality and prior_modality and current_modality != prior_modality:
+        if current_anatomy and prior_anatomy and not current_anatomy.isdisjoint(prior_anatomy):
+            score += WEIGHTS["cross_modality_related"]
+
+    if current_anatomy and prior_anatomy and not current_anatomy.isdisjoint(prior_anatomy):
+        score += WEIGHTS["same_anatomy"]
+
+    score += keyword_overlap_score(current_tokens, prior_tokens)
+
+    if has_negative_conflict(current_anatomy, prior_anatomy):
+        score += WEIGHTS["negative_conflict"]
+
+    return score
+
+
+def predict_is_relevant(current_study: Dict, prior: PriorStudy) -> bool:
+    return score_pair(current_study, prior) >= THRESHOLD
+
+
+def predict_batch(case: Case) -> List[PredictionItem]:
+    predictions = []
+
+    current_study = case.current_study or {}
+
+    for prior in case.prior_studies:
+        predictions.append(
+            PredictionItem(
+                case_id=case.case_id,
+                study_id=prior.study_id,
+                predicted_is_relevant=predict_is_relevant(current_study, prior),
+            )
+        )
+
+    return predictions

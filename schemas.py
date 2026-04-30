@@ -1,41 +1,38 @@
-from __future__ import annotations
-
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
-class Study(BaseModel):
+class PriorStudy(BaseModel):
+    case_id: Optional[str] = None
     study_id: str
-    study_description: str
-    study_date: str
+    description: Optional[str] = ""
+    modality: Optional[str] = ""
+    body_part: Optional[str] = ""
+    report: Optional[str] = ""
+    date: Optional[str] = None
 
-
-class CurrentStudy(BaseModel):
-    study_id: str
-    study_description: str
-    study_date: str
+    class Config:
+        extra = "allow"
 
 
 class Case(BaseModel):
     case_id: str
-    patient_id: Optional[str] = None
-    patient_name: Optional[str] = None
-    current_study: CurrentStudy
-    prior_studies: List[Study] = Field(default_factory=list)
+    current_study: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    prior_studies: List[PriorStudy] = Field(default_factory=list)
+
+    class Config:
+        extra = "allow"
 
 
 class PredictRequest(BaseModel):
-    challenge_id: Optional[str] = None
-    schema_version: Optional[int] = None
-    generated_at: Optional[str] = None
     cases: List[Case]
 
 
-class Prediction(BaseModel):
+class PredictionItem(BaseModel):
     case_id: str
     study_id: str
     predicted_is_relevant: bool
 
 
 class PredictResponse(BaseModel):
-    predictions: List[Prediction]
+    predictions: List[PredictionItem]

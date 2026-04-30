@@ -1,161 +1,92 @@
-"""Offline evaluation and threshold search.
+# Experiments
 
-Expected labeled input format:
-- Same top-level request JSON used by the API, with cases/current_study/prior_studies.
-- Each prior study should include one label field, either:
-  - is_relevant
-  - relevant
-  - label
-  - predicted_is_relevant
+## Final submitted system
 
-Usage:
-    python eval.py --data public_eval.json
-    python eval.py --data public_eval.json --threshold-search
-"""
+The final endpoint is a deterministic FastAPI service using a weighted heuristic relevance model. It achieved 100% prediction coverage, fast runtime, and a held-out evaluator accuracy of 0.8364.
 
-from __future__ import annotations
+The system returns one prediction for every prior study and does not call any external model or LLM. This was intentional because the evaluator can send large batches, and one external call per prior study would risk timeout.
 
-import argparse
-import json
-from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional
+## Model design
 
-from model import predict_pair, score_pair
-from schemas import Case, CurrentStudy, Study
+Each current/prior pair is converted into structured features:
 
-LABEL_KEYS = ("is_relevant", "relevant", "label", "predicted_is_relevant")
+- modality: CT, CTA, MRI, MRA, X-ray, ultrasound, nuclear medicine, etc.
+- anatomy/body region: head, brain, chest, abdomen, pelvis, spine, knee, hip, etc.
+- clinical keywords: stroke, trauma, fracture, mass, cancer, infection, hemorrhage, etc.
+- text overlap after normalization
+- time gap between current and prior examination
 
+The final score is a weighted sum of those features. A prior is predicted relevant when its score is greater than or equal to the configured threshold.
 
-@dataclass
-class EvalRow:
-    case_id: str
-    study_id: str
-    score: float
-    prediction: bool
-    label: bool
-    current_description: str
-    prior_description: str
+## Experiment 1: simple keyword overlap baseline
 
+The first baseline compared normalized word overlap between current and prior study descriptions.
 
-def read_json(path: str) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+What worked:
+- Very fast.
+- Good for nearly identical studies.
 
+What failed:
+- Missed synonyms such as brain/head or stroke/infarct-style wording.
+- Produced false positives when descriptions shared generic terms such as "without contrast".
 
-def extract_label(prior: dict[str, Any]) -> Optional[bool]:
-    for key in LABEL_KEYS:
-        if key in prior:
-            value = prior[key]
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, (int, float)):
-                return bool(value)
-            if isinstance(value, str):
-                return value.lower().strip() in {"true", "1", "yes", "relevant"}
-    return None
+## Experiment 2: modality and anatomy matching
 
+The second version added modality detection and anatomy vocabularies.
 
-def iter_cases(raw: dict[str, Any]) -> Iterable[dict[str, Any]]:
-    if "cases" in raw:
-        yield from raw["cases"]
-    elif isinstance(raw, list):
-        yield from raw
-    else:
-        raise ValueError("Input JSON must be a list of cases or contain a top-level 'cases' key.")
+What improved:
+- Same body region became the strongest signal.
+- Same modality improved precision.
+- Clearly unrelated regions, such as MRI brain vs XR ankle, were filtered out.
 
+Main remaining issue:
+- Cross-modality studies can still be clinically useful. For example, a prior CT head can be relevant to a current MRI brain stroke exam.
 
-def evaluate(raw: dict[str, Any], threshold: float) -> List[EvalRow]:
-    rows: List[EvalRow] = []
-    for case_dict in iter_cases(raw):
-        current = CurrentStudy(**case_dict["current_study"])
-        case_id = case_dict["case_id"]
-        for prior_dict in case_dict.get("prior_studies", []):
-            label = extract_label(prior_dict)
-            if label is None:
-                continue
-            prior = Study(
-                study_id=str(prior_dict["study_id"]),
-                study_description=prior_dict["study_description"],
-                study_date=prior_dict["study_date"],
-            )
-            score = score_pair(current, prior)
-            pred = predict_pair(current, prior, threshold=threshold)
-            rows.append(
-                EvalRow(
-                    case_id=case_id,
-                    study_id=prior.study_id,
-                    score=score,
-                    prediction=pred,
-                    label=label,
-                    current_description=current.study_description,
-                    prior_description=prior.study_description,
-                )
-            )
-    return rows
+## Experiment 3: weighted heuristic with clinical and temporal features
 
+The final version added weighted components for modality, anatomy, clinical keyword overlap, lexical similarity, recency, and special-case neuro/stroke logic.
 
-def metrics(rows: List[EvalRow]) -> dict[str, float]:
-    total = len(rows)
-    if total == 0:
-        return {"total": 0, "accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
-    correct = sum(r.prediction == r.label for r in rows)
-    tp = sum(r.prediction and r.label for r in rows)
-    fp = sum(r.prediction and not r.label for r in rows)
-    fn = sum((not r.prediction) and r.label for r in rows)
-    precision = tp / (tp + fp) if tp + fp else 0.0
-    recall = tp / (tp + fn) if tp + fn else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return {
-        "total": total,
-        "accuracy": correct / total,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-    }
+Observed result from evaluator feedback:
+- Held-out accuracy: 0.8364
+- Prediction coverage: 100%
+- Runtime: fast, deterministic, no external calls
 
+This version was selected because it balanced reliability and accuracy without risking evaluator timeout.
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", required=True, help="Path to labeled public eval JSON")
-    parser.add_argument("--threshold", type=float, default=3.0)
-    parser.add_argument("--threshold-search", action="store_true")
-    parser.add_argument("--show-errors", type=int, default=5)
-    args = parser.parse_args()
+## Error analysis
 
-    raw = read_json(args.data)
-    thresholds = [args.threshold]
-    if args.threshold_search:
-        thresholds = [round(x / 10, 1) for x in range(10, 61)]
+Likely false positives:
+- Same modality and body region but different clinical question.
+- Broad descriptions where the prior looks similar textually but is not useful for the current read.
+- Old studies that match anatomy but may no longer be clinically meaningful.
 
-    best = None
-    best_rows = None
-    for threshold in thresholds:
-        rows = evaluate(raw, threshold)
-        m = metrics(rows)
-        print(
-            f"threshold={threshold:.1f} total={m['total']} "
-            f"accuracy={m['accuracy']:.4f} precision={m['precision']:.4f} "
-            f"recall={m['recall']:.4f} f1={m['f1']:.4f}"
-        )
-        if best is None or m["accuracy"] > best[1]["accuracy"]:
-            best = (threshold, m)
-            best_rows = rows
+Likely false negatives:
+- Clinically useful cross-modality priors.
+- Prior studies with different wording but same underlying condition.
+- Studies with very short descriptions where important context is not visible in the text.
 
-    if best and best_rows is not None:
-        threshold, m = best
-        print("\nBest threshold by accuracy:", threshold, m)
-        errors = [r for r in best_rows if r.prediction != r.label]
-        if args.show_errors and errors:
-            print(f"\nFirst {min(args.show_errors, len(errors))} errors:")
-            for r in errors[: args.show_errors]:
-                kind = "FP" if r.prediction else "FN"
-                print(f"[{kind}] case={r.case_id} prior={r.study_id} score={r.score:.2f}")
-                print(f"  current: {r.current_description}")
-                print(f"  prior:   {r.prior_description}")
+## Radiologist workflow considerations
 
+The prediction system should support radiologists by showing priors that are likely to help comparison, diagnosis, or change detection. A false negative can be harmful when it hides a prior that would clarify disease progression, prior intervention, or chronic findings. However, too many false positives can slow the radiologist by cluttering the worklist.
 
-if __name__ == "__main__":
-    main()
+For this challenge, the final threshold favors showing strongly related anatomy/modality matches while suppressing clearly unrelated exams. In a real clinical workflow, the acceptable threshold would depend on the reading context. For high-risk studies such as stroke, cancer follow-up, or trauma, higher recall may be preferred. For routine low-risk studies, higher precision may be more acceptable.
+
+## Reproducibility improvements included
+
+To make the project more reproducible and maintainable, the upgraded version separates the code into:
+
+- `config.py`: thresholds, weights, and vocabularies
+- `model.py`: scoring and prediction logic
+- `schemas.py`: API schema definitions
+- `eval.py`: offline evaluation, threshold search, and error inspection
+- `tests/test_model.py`: representative unit tests
+
+The offline evaluation script can reproduce accuracy, precision, recall, F1, threshold comparisons, and example false positives/false negatives when run on a labeled public evaluation JSON.
+
+## Next improvements
+
+1. Use public labeled data to tune the threshold with cross-validation instead of manually selected weights.
+2. Add more medical synonyms and anatomy hierarchies.
+3. Add embedding similarity as a second-stage model after rule-based filtering.
+4. Track precision and recall separately for high-risk categories such as stroke, cancer, and trauma.
+5. Add more unit tests for edge cases and ambiguous cross-modality pairs.

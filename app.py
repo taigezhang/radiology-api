@@ -1,8 +1,8 @@
 from fastapi import FastAPI
-from schemas import PredictRequest, PredictResponse, PredictionItem
+from schemas import PredictRequest, PredictResponse
 from model import predict_batch
 
-app = FastAPI()
+app = FastAPI(title="Relevant Priors API")
 
 
 @app.get("/")
@@ -12,22 +12,9 @@ def health_check():
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictRequest):
-    """
-    Main prediction endpoint.
-    Expects:
-    {
-        "cases": [...]
-    }
-
-    Returns:
-    {
-        "predictions": [...]
-    }
-    """
     predictions = []
 
     for case in request.cases:
-        case_predictions = predict_batch(case)
-        predictions.extend(case_predictions)
+        predictions.extend(predict_batch(case))
 
     return PredictResponse(predictions=predictions)

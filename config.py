@@ -1,45 +1,51 @@
-from __future__ import annotations
+THRESHOLD = 5.0
 
-import hashlib
-from typing import Dict, List
+WEIGHTS = {
+    "same_modality": 2.0,
+    "same_anatomy": 3.0,
+    "keyword_overlap": 1.0,
+    "strong_keyword_overlap": 2.0,
+    "cross_modality_related": 1.0,
+    "negative_conflict": -3.0,
+}
 
-from fastapi import FastAPI, Request
+MODALITIES = {
+    "ct": ["ct", "computed tomography", "cat scan"],
+    "mri": ["mri", "magnetic resonance"],
+    "xr": ["xray", "x-ray", "radiograph", "xr"],
+    "us": ["ultrasound", "sonogram", "us"],
+    "pet": ["pet"],
+    "nm": ["nuclear medicine", "nm"],
+}
 
-from model import predict_pair
-from schemas import PredictRequest, Prediction, PredictResponse
+ANATOMY_GROUPS = {
+    "head_brain": [
+        "head", "brain", "skull", "intracranial", "cerebral",
+        "stroke", "infarct", "hemorrhage", "ich"
+    ],
+    "chest_lung": [
+        "chest", "lung", "pulmonary", "thorax", "pe", "embolism",
+        "pneumonia", "pleural"
+    ],
+    "abdomen_pelvis": [
+        "abdomen", "pelvis", "abdominal", "hepatic", "liver",
+        "kidney", "renal", "bowel", "appendix", "pancreas"
+    ],
+    "spine": [
+        "spine", "cervical", "thoracic", "lumbar", "vertebra",
+        "disc", "cord"
+    ],
+    "extremity": [
+        "arm", "hand", "wrist", "elbow", "shoulder", "leg",
+        "knee", "ankle", "foot", "hip", "femur", "tibia"
+    ],
+    "cardiac": [
+        "heart", "cardiac", "coronary", "aorta", "vascular"
+    ],
+}
 
-app = FastAPI(title="Relevant Priors API", version="2.0.0")
-
-
-@app.get("/")
-def health() -> Dict[str, str]:
-    return {"status": "ok", "message": "POST JSON to /predict"}
-
-
-@app.get("/health")
-def health_check() -> Dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.post("/predict", response_model=PredictResponse)
-async def predict(payload: PredictRequest, request: Request) -> PredictResponse:
-    predictions: List[Prediction] = []
-    total_priors = 0
-
-    for case in payload.cases:
-        total_priors += len(case.prior_studies)
-        for prior in case.prior_studies:
-            predictions.append(
-                Prediction(
-                    case_id=case.case_id,
-                    study_id=prior.study_id,
-                    predicted_is_relevant=predict_pair(case.current_study, prior),
-                )
-            )
-
-    req_id = hashlib.md5(str(payload.model_dump()).encode()).hexdigest()[:8]
-    print(
-        f"request_id={req_id} cases={len(payload.cases)} "
-        f"priors={total_priors} predictions={len(predictions)}"
-    )
-    return PredictResponse(predictions=predictions)
+IMPORTANT_KEYWORDS = {
+    "stroke", "infarct", "hemorrhage", "mass", "tumor", "cancer",
+    "metastasis", "fracture", "embolism", "aneurysm", "infection",
+    "abscess", "pneumonia", "appendicitis", "obstruction"
+}

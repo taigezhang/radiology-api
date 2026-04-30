@@ -1,68 +1,89 @@
-"""Configuration for the deterministic relevant-prior scoring model.
+import argparse
+import json
+from typing import Any, Dict, List
 
-The challenge data did not include a public training split with stable labels in this
-repository, so these weights are manually selected from local error analysis and
-made explicit here to avoid hiding tuned constants inside endpoint code.
-"""
+from model import score_pair
+from schemas import Case, PriorStudy
 
-THRESHOLD = 3.0
 
-WEIGHTS = {
-    "exact_description": 5.0,
-    "same_modality": 2.0,
-    "related_modality": 1.0,
-    "different_modality": -1.5,
-    "body_overlap_base": 3.0,
-    "body_overlap_bonus_cap": 1.0,
-    "body_overlap_bonus_each": 0.25,
-    "no_body_overlap": -2.0,
-    "clinical_overlap": 1.0,
-    "lexical_similarity_multiplier": 2.0,
-    "recency_le_1_year": 1.0,
-    "recency_le_3_years": 0.5,
-    "old_prior_gt_8_years": -0.75,
-    "negative_exam_penalty": -0.75,
-    "stroke_brain_bonus": 1.25,
-}
+def load_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-STOPWORDS = {
-    "and", "or", "the", "of", "for", "with", "without", "w", "wo", "contrast",
-    "cntrst", "limited", "complete", "exam", "study", "views", "view", "routine",
-}
 
-MODALITY_ALIASES = {
-    "computed tomography": "ct",
-    "ct": "ct",
-    "cta": "cta",
-    "mri": "mri",
-    "mr": "mri",
-    "mra": "mra",
-    "x-ray": "xray",
-    "xray": "xray",
-    "xr": "xray",
-    "radiograph": "xray",
-    "us": "ultrasound",
-    "ultrasound": "ultrasound",
-    "pet": "pet",
-    "nm": "nuclear",
-    "nuclear": "nuclear",
-    "fluoro": "fluoro",
-    "mammogram": "mammogram",
-    "mammo": "mammogram",
-}
+def evaluate(data: Dict[str, Any], threshold: float) -> Dict[str, float]:
+    total = 0
+    correct = 0
+    tp = fp = tn = fn = 0
 
-BODY_TERMS = {
-    "brain", "head", "neck", "cervical", "thoracic", "lumbar", "spine", "chest",
-    "abdomen", "pelvis", "knee", "hip", "shoulder", "ankle", "foot", "hand", "wrist",
-    "elbow", "femur", "tibia", "fibula", "humerus", "forearm", "sinus", "face",
-    "cardiac", "heart", "coronary", "renal", "kidney", "liver", "biliary", "breast",
-    "prostate", "thyroid", "vascular", "aorta", "carotid", "lung", "mandible",
-}
+    for raw_case in data.get("cases", []):
+        case = Case(**raw_case)
+        current = case.current_study or {}
 
-CLINICAL_TERMS = {
-    "stroke", "trauma", "fracture", "mass", "tumor", "cancer", "metastasis", "pain",
-    "infection", "abscess", "hemorrhage", "bleed", "aneurysm", "embolism", "pe",
-    "pneumonia", "nodule", "seizure", "headache", "dizziness", "weakness",
-}
+        for prior in case.prior_studies:
+            label = getattr(prior, "label", None)
 
-NEGATIVE_EXAM_TERMS = {"screening", "portable", "single", "preop", "pre-op"}
+            if label is None:
+                raw_prior = prior.model_dump()
+                label = raw_prior.get("is_relevant", raw_prior.get("label"))
+
+            if label is None:
+                continue
+
+            pred = score_pair(current, prior) >= threshold
+            gold = bool(label)
+
+            total += 1
+            correct += int(pred == gold)
+
+            if pred and gold:
+                tp += 1
+            elif pred and not gold:
+                fp += 1
+            elif not pred and not gold:
+                tn += 1
+            elif not pred and gold:
+                fn += 1
+
+    accuracy = correct / total if total else 0.0
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+    return {
+        "threshold": threshold,
+        "total": total,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", required=True, help="Path to labeled validation JSON")
+    parser.add_argument("--threshold", type=float, default=5.0)
+    parser.add_argument("--search", action="store_true")
+    args = parser.parse_args()
+
+    data = load_json(args.data)
+
+    if args.search:
+        best = None
+        for threshold in [x / 2 for x in range(2, 21)]:
+            result = evaluate(data, threshold)
+            if best is None or result["accuracy"] > best["accuracy"]:
+                best = result
+            print(result)
+        print("\nBest:", best)
+    else:
+        print(evaluate(data, args.threshold))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,8 +1,28 @@
 # Relevant Priors API
 
-This project exposes a FastAPI `/predict` endpoint for the relevant-priors challenge.
+FastAPI endpoint that predicts whether prior radiology examinations should be shown while a radiologist reads the current examination.
 
-## Run locally
+## Endpoint
+
+```bash
+POST /predict
+```
+
+Response format:
+
+```json
+{
+  "predictions": [
+    {
+      "case_id": "1001016",
+      "study_id": "2453245",
+      "predicted_is_relevant": true
+    }
+  ]
+}
+```
+
+## Local run
 
 ```bash
 pip install -r requirements.txt
@@ -17,9 +37,13 @@ curl -X POST http://localhost:8000/predict \
   -d @sample_request.json
 ```
 
-## Deploy
+## Render deployment
 
-Recommended quick deployment: Render, Railway, Fly.io, or any VM.
+Build command:
+
+```bash
+pip install -r requirements.txt
+```
 
 Start command:
 
@@ -27,24 +51,27 @@ Start command:
 uvicorn app:app --host 0.0.0.0 --port $PORT
 ```
 
-Endpoint to submit:
+The repository includes `.python-version` and `runtime.txt` to pin Python 3.11.9.
+
+## Project structure
 
 ```text
-https://YOUR-DOMAIN/predict
+app.py              FastAPI app and API route
+schemas.py          Pydantic request/response models
+model.py            scoring and prediction logic
+config.py           weights, threshold, vocabularies
+eval.py             offline evaluation + threshold search
+tests/test_model.py unit tests for representative exam-pair behavior
+experiments.md      experiment log and improvement plan
 ```
 
-## Method
+## Offline evaluation
 
-The model is a deterministic rule-based classifier. It parses the current and prior study descriptions into modality, body region, clinical terms, and lexical tokens. It predicts a prior as relevant when the prior shares strong body-region/modality similarity with the current examination, with additional boosts for exact exam matches, clinical terms, and recency.
+For a labeled public eval JSON where each prior study contains `is_relevant`, `relevant`, `label`, or `predicted_is_relevant`:
 
-## Experiments
+```bash
+python eval.py --data public_eval.json
+python eval.py --data public_eval.json --threshold-search --show-errors 10
+```
 
-Baseline: mark only exact study-description matches as relevant. This is high precision but misses many useful priors such as CT head for MRI brain stroke.
-
-Improved version: add body-region, modality, clinical-keyword, and recency scoring. This handles cases where the wording differs but the prior is clinically useful.
-
-What worked: same body region plus same/related modality was the strongest signal. A special stroke/head rule improved cases where CT head and MRI brain stroke are not exact string matches but are still useful priors.
-
-What failed: overly strict modality matching missed related exams. Overly broad lexical matching caused unrelated same-word exams to be marked relevant, so the final rule requires body-region agreement.
-
-Next improvements: train a small text classifier on the public split, add more medical synonym mappings, calibrate thresholds by exam family, and use batch LLM labeling only offline to generate weak labels rather than calling an LLM during evaluation.
+The script reports accuracy, precision, recall, F1, and example false positives/false negatives.
